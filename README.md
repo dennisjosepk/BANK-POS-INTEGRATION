@@ -66,7 +66,7 @@ The EXE is unsigned, so Windows may show an unknown-publisher notice.
 
 Alternatively, after this project has been pushed to GitHub, open **Actions → Build Windows application → Run workflow**.
 Download the **ReceiptRecorder-Windows** artifact from a successful run and extract the EXE.
-The workflow has been provided but has not been run in this cloud task.
+Build results and downloadable files appear in the Actions run.
 
 ## Future bank/POS connections
 

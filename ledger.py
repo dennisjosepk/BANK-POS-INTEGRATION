@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import re
 import sqlite3
+from contextlib import closing
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -186,7 +187,7 @@ class Ledger:
         path = Path(path)
         if path.resolve() == self.path.resolve() or (path.exists() and path.samefile(self.path)):
             raise ValueError("Choose a backup location different from the live database.")
-        with sqlite3.connect(path) as target:
+        with closing(sqlite3.connect(path)) as target:
             self.connection.backup(target)
 
     def close(self) -> None:

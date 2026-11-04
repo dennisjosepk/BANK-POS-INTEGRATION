@@ -18,7 +18,22 @@ jobs:
         with:
           python-version: '3.12'
       - name: Test the ledger and desktop application
-        run: python -m unittest discover -s tests -v
+        shell: python
+        run: |
+          import os
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          result = subprocess.run(
+              [sys.executable, "-m", "unittest", "discover", "-s", "tests", "-v"],
+              capture_output=True, text=True, encoding="utf-8", errors="replace",
+          )
+          report = result.stdout + result.stderr
+          print(report, end="")
+          with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a", encoding="utf-8") as summary:
+              summary.write("### Receipt Recorder tests\n\n```text\n" + report + "\n```\n")
+          sys.exit(result.returncode)
       - name: Install Windows packaging tools
         run: python -m pip install -r requirements-build.txt
       - name: Build executable
