@@ -1,0 +1,2 @@
+# Only needed to build a Windows executable. Running the source needs no packages.
+PyInstaller==6.16.0
