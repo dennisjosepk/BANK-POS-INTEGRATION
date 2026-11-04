@@ -80,6 +80,8 @@ class Ledger:
                     received_date TEXT NOT NULL,
                     amount_minor INTEGER NOT NULL CHECK (amount_minor > 0),
                     payer TEXT NOT NULL,
+                    payer_phone TEXT NOT NULL DEFAULT '',
+                    payer_address TEXT NOT NULL DEFAULT '',
                     method TEXT NOT NULL,
                     reference TEXT NOT NULL,
                     notes TEXT NOT NULL,
@@ -87,6 +89,29 @@ class Ledger:
                     voided_at TEXT
                 );
             """)
+        columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(receipts)")}
+        missing = {"payer_phone", "payer_address"} - columns
+        if missing:
+            # Back up the original schema and records before upgrading an existing receipt book.
+            backup = self.path.with_name(self.path.stem + "-before-printing-update.sqlite3")
+            if not backup.exists():
+                self.backup(backup)
+            with self.connection:
+                for name in sorted(missing):
+                    self.connection.execute(f"ALTER TABLE receipts ADD COLUMN {name} TEXT NOT NULL DEFAULT ''")
+
+    def preference(self, key: str, default: str = "") -> str:
+        row = self.connection.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+        return row[0] if row else default
+
+    def set_preference(self, key: str, value: str) -> None:
+        if key not in ("receipt_design", "print_after_save"):
+            raise ValueError("Unknown application preference.")
+        with self.connection:
+            self.connection.execute(
+                "INSERT INTO settings(key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (key, value)
+            )
 
     @property
     def currency(self) -> str | None:
@@ -110,7 +135,7 @@ class Ledger:
             )
 
     def add(self, received_date: str, amount: str, payer: str = "", method: str = "Cash",
-            reference: str = "", notes: str = "") -> int:
+            reference: str = "", notes: str = "", payer_phone: str = "", payer_address: str = "") -> int:
         currency = self.currency
         if currency is None:
             raise ValueError("Choose the ledger currency first.")
@@ -125,24 +150,43 @@ class Ledger:
         if method not in METHODS:
             raise ValueError("Choose a payment method from the list.")
         for name, value, limit in (("Payer", payer, 120), ("Reference", reference, 120),
-                                   ("Notes", notes, 1000)):
+                                   ("Notes", notes, 1000), ("Phone", payer_phone, 60),
+                                   ("Address", payer_address, 500)):
             if len(value) > limit:
                 raise ValueError(f"{name} must be {limit} characters or fewer.")
         minor = parse_amount(amount, currency)
         with self.connection:
             cursor = self.connection.execute(
                 """INSERT INTO receipts
-                   (received_date, amount_minor, payer, method, reference, notes, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                   (received_date, amount_minor, payer, method, reference, notes, created_at, payer_phone, payer_address)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (received_date, minor, payer.strip(), method, reference.strip(), notes.strip(),
-                 datetime.now(timezone.utc).isoformat(timespec="seconds")),
+                 datetime.now(timezone.utc).isoformat(timespec="seconds"), payer_phone.strip(), payer_address.strip()),
             )
         return cursor.lastrowid
 
-    def receipts(self) -> list[sqlite3.Row]:
+    def receipts(self, date_from: str = "", date_to: str = "") -> list[sqlite3.Row]:
+        for value in (date_from, date_to):
+            if value:
+                try:
+                    parsed = date.fromisoformat(value)
+                    if parsed.isoformat() != value:
+                        raise ValueError
+                except ValueError:
+                    raise ValueError("Filter dates must be YYYY-MM-DD.") from None
+        if date_from and date_to and date_from > date_to:
+            raise ValueError("From date must be on or before To date.")
         return self.connection.execute(
-            "SELECT * FROM receipts ORDER BY received_date DESC, id DESC"
+            "SELECT * FROM receipts WHERE (? = '' OR received_date >= ?) "
+            "AND (? = '' OR received_date <= ?) ORDER BY received_date DESC, id DESC",
+            (date_from, date_from, date_to, date_to),
         ).fetchall()
+
+    def receipt(self, receipt_id: int) -> sqlite3.Row:
+        row = self.connection.execute("SELECT * FROM receipts WHERE id = ?", (receipt_id,)).fetchone()
+        if row is None:
+            raise ValueError("Receipt not found.")
+        return row
 
     def totals(self) -> tuple[int, int, int]:
         rows = self.connection.execute(
@@ -161,11 +205,11 @@ class Ledger:
             if not cursor.rowcount:
                 raise ValueError("This receipt was already voided or no longer exists.")
 
-    def export_csv(self, path: Path) -> int:
+    def export_csv(self, path: Path, date_from: str = "", date_to: str = "") -> int:
         path = Path(path)
         if path.resolve() == self.path.resolve() or (path.exists() and path.samefile(self.path)):
             raise ValueError("Choose an export location different from the live database.")
-        rows = self.receipts()
+        rows = self.receipts(date_from, date_to)
         currency = self.currency
         if currency is None:
             raise ValueError("Choose the ledger currency first.")
@@ -173,14 +217,15 @@ class Ledger:
             writer = csv.writer(output)
             writer.writerow(("Receipt ID", "Received date", "Amount", "Currency", "Payer",
                              "Payment method", "Reference", "Notes", "Status",
-                             "Recorded at (UTC)", "Voided at (UTC)"))
+                             "Recorded at (UTC)", "Voided at (UTC)", "Payer phone", "Payer address"))
             for row in rows:
                 writer.writerow((row["id"], row["received_date"],
                                  format_amount(row["amount_minor"], currency, grouping=False),
                                  currency, spreadsheet_text(row["payer"]), row["method"],
                                  spreadsheet_text(row["reference"]), spreadsheet_text(row["notes"]),
                                  "Voided" if row["voided_at"] else "Recorded",
-                                 row["created_at"], row["voided_at"] or ""))
+                                 row["created_at"], row["voided_at"] or "",
+                                 spreadsheet_text(row["payer_phone"]), spreadsheet_text(row["payer_address"])))
         return len(rows)
 
     def backup(self, path: Path) -> None:

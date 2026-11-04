@@ -1,0 +1,3 @@
+# Optional browser checks only; not needed to run or print from the application.
+playwright==1.62.0
+pypdf==6.10.0

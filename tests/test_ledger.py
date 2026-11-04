@@ -1,4 +1,5 @@
 import csv
+import sqlite3
 import tempfile
 import unittest
 from datetime import date, timedelta
@@ -103,6 +104,83 @@ class LedgerTests(unittest.TestCase):
         self.assertEqual(format_amount(1001, "KWD"), "1.001")
         with self.assertRaises(ValueError):
             parse_amount("150.01", "JPY")
+
+    def test_customer_details_and_preferences_survive_restart(self):
+        receipt_id = self.ledger.add(self.today, "99.95", "Customer / Company", payer_phone="0501234567",
+                                     payer_address="Riyadh\nStreet 2")
+        self.ledger.set_preference("print_after_save", "1")
+        self.ledger.close()
+        self.ledger = Ledger(self.path)
+        row = self.ledger.receipt(receipt_id)
+        self.assertEqual(row["payer_phone"], "0501234567")
+        self.assertEqual(row["payer_address"], "Riyadh\nStreet 2")
+        self.assertEqual(self.ledger.preference("print_after_save"), "1")
+        with self.assertRaises(ValueError):
+            self.ledger.receipt(999)
+
+    def test_inclusive_date_filters_and_csv_use_the_same_range(self):
+        days = [(date.today() - timedelta(days=n)).isoformat() for n in (2, 1, 0)]
+        for day, amount in zip(days, ("1", "2", "3")):
+            self.ledger.add(day, amount, payer_phone="0501112222", payer_address="Company address")
+        self.assertEqual(len(self.ledger.receipts(days[0], days[1])), 2)
+        self.assertEqual(len(self.ledger.receipts("", days[1])), 2)
+        self.assertEqual(len(self.ledger.receipts(days[1], "")), 2)
+        self.assertEqual(len(self.ledger.receipts(days[1], days[1])), 1)
+        for start, end in ((days[2], days[0]), ("2026-99-01", ""), ("20261104", "")):
+            with self.subTest(start=start, end=end), self.assertRaises(ValueError):
+                self.ledger.receipts(start, end)
+        output = Path(self.temp.name) / "filtered.csv"
+        self.assertEqual(self.ledger.export_csv(output, days[1], days[1]), 1)
+        with output.open(encoding="utf-8-sig", newline="") as source:
+            row = list(csv.DictReader(source))[0]
+        self.assertEqual(row["Amount"], "2.00")
+        self.assertEqual(row["Payer phone"], "0501112222")
+        self.assertEqual(row["Payer address"], "Company address")
+        self.assertEqual(self.ledger.totals()[1], 600)
+
+    def test_legacy_receipts_are_backed_up_and_migrated_without_data_loss(self):
+        legacy = Path(self.temp.name) / "legacy.sqlite3"
+        with sqlite3.connect(legacy) as connection:
+            connection.executescript("""
+                CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                INSERT INTO settings VALUES ('currency', 'SAR');
+                CREATE TABLE receipts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, received_date TEXT NOT NULL,
+                    amount_minor INTEGER NOT NULL, payer TEXT NOT NULL, method TEXT NOT NULL,
+                    reference TEXT NOT NULL, notes TEXT NOT NULL, created_at TEXT NOT NULL, voided_at TEXT
+                );
+                INSERT INTO receipts VALUES (42, '2026-11-03', 10000, 'Original customer', 'Cash',
+                                             'INV-OLD', 'Original notes', '2026-11-03T10:00:00+00:00', NULL);
+            """)
+        connection.close()
+        upgraded = Ledger(legacy)
+        try:
+            original = upgraded.receipt(42)
+            self.assertEqual(original["amount_minor"], 10000)
+            self.assertEqual(original["payer"], "Original customer")
+            self.assertEqual(original["reference"], "INV-OLD")
+            self.assertEqual(original["payer_phone"], "")
+            new_id = upgraded.add(self.today, "5", payer_phone="123")
+            self.assertGreater(new_id, 42)
+        finally:
+            upgraded.close()
+        backup = legacy.with_name("legacy-before-printing-update.sqlite3")
+        self.assertTrue(backup.exists())
+        with sqlite3.connect(backup) as original:
+            self.assertEqual(original.execute("SELECT COUNT(*) FROM receipts").fetchone()[0], 1)
+            self.assertNotIn("payer_phone", {row[1] for row in original.execute("PRAGMA table_info(receipts)")})
+        original.close()
+        upgraded = Ledger(legacy)
+        try:
+            self.assertEqual(len(upgraded.receipts()), 2)
+        finally:
+            upgraded.close()
+
+    def test_customer_details_have_length_limits(self):
+        for values in ({"payer_phone": "x" * 61}, {"payer_address": "x" * 501}):
+            with self.assertRaises(ValueError):
+                self.ledger.add(self.today, "1", **values)
+        self.assertEqual(self.ledger.receipts(), [])
 
 
 if __name__ == "__main__":

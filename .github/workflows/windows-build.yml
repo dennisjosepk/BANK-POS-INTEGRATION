@@ -34,6 +34,25 @@ jobs:
           with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a", encoding="utf-8") as summary:
               summary.write("### Receipt Recorder tests\n\n```text\n" + report + "\n```\n")
           sys.exit(result.returncode)
+      - name: Install print layout validation tools
+        run: python -m pip install -r requirements-test.txt
+      - name: Check 80 mm print pages in Microsoft Edge
+        shell: python
+        run: |
+          import os
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          result = subprocess.run(
+              [sys.executable, "scripts/check_print_layout.py"],
+              capture_output=True, text=True, encoding="utf-8", errors="replace",
+          )
+          report = result.stdout + result.stderr
+          print(report, end="")
+          with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a", encoding="utf-8") as summary:
+              summary.write("### 80 mm browser print check\n\n```text\n" + report + "\n```\n")
+          sys.exit(result.returncode)
       - name: Install Windows packaging tools
         run: python -m pip install -r requirements-build.txt
       - name: Build executable
