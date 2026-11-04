@@ -11,6 +11,7 @@ from pypdf import PdfReader
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from receipt_printing import ReceiptDesign, render_receipts_html
+from pos import BANK_METHOD
 
 
 def main():
@@ -19,7 +20,10 @@ def main():
                notes="Payment received in full.", created_at="2026-11-04T08:00:00+00:00", voided_at=None)
     long_row = dict(row, id=2, payer_address=("Long address " * 35)[:490],
                     notes=("Detailed receipt note " * 45)[:950] + " END-OF-NOTES")
-    html = render_receipts_html([row, long_row], "SAR", ReceiptDesign(merchant_name="Example Business"), reprint=True)
+    bank_row = dict(row, id=3, method=BANK_METHOD, card_brand="Visa", card_last4="0012",
+                    pos_transaction_id="BANK-TX-001", pos_authorization_code="AUTH1",
+                    pos_terminal_id="TERM1", pos_provider_id="Example-provider")
+    html = render_receipts_html([row, long_row, bank_row], "SAR", ReceiptDesign(merchant_name="Example Business"), reprint=True)
     with tempfile.TemporaryDirectory() as folder, sync_playwright() as playwright:
         if sys.platform == "win32":
             browser = playwright.chromium.launch(channel="msedge", headless=True)
@@ -42,7 +46,7 @@ def main():
             pdf = Path(folder) / "receipts.pdf"
             page.pdf(path=str(pdf), prefer_css_page_size=True, print_background=True)
             reader = PdfReader(pdf)
-            if len(reader.pages) != 2:
+            if len(reader.pages) != 3:
                 raise AssertionError(f"Expected one page per receipt, got {len(reader.pages)}")
             for index, sheet in enumerate(reader.pages, 1):
                 width = float(sheet.mediabox.width) * 25.4 / 72
@@ -61,6 +65,10 @@ def main():
                 raise AssertionError("Long notes were cut off")
             if "".join(long_row["payer_address"].split()) not in text:
                 raise AssertionError("Long address was cut off")
+            card_text = reader.pages[2].extract_text()
+            for expected in ("Visa", "0012", "BANK-TX-001", "AUTH1", "TERM1"):
+                if expected not in card_text:
+                    raise AssertionError(f"Card receipt is missing {expected}")
             reader.close()
             print("Print button, 80 mm paper, separate receipts and long notes passed.")
         finally:

@@ -1,11 +1,18 @@
 # Receipt Recorder
 
 A small Windows desktop application for recording money received in **Saudi riyals (SAR)**.
-It works offline and saves receipts on the computer. This first version records receipts manually;
-it does not send transactions to a bank POS machine.
+Manual methods work offline and save receipts on the computer. The **Card (Bank POS)** workflow
+requires a compatible supplier connector. **No live supplier connector is bundled in this build.**
+Bank SDK/protocol documentation is still needed to implement and test one for actual terminals.
 
 Version **1.1.0** adds 80 mm thermal receipts, a receipt designer, customer contact details,
 date filters and selected-record reprinting.
+
+Version **1.2.0** adds the bank-POS method, a cancellable payment window, USB/COM setup,
+connection checking, an approval-only receipt workflow, pending-payment recovery, and card type/last-four
+fields in receipts and reports. These paths are validated using test-only connector processes,
+not a bank terminal. Devices sharing one ECR protocol can reuse an implemented connector;
+different protocols need different connectors even when both expose a COM port.
 
 ![Application design preview with example receipts](docs/design-preview.png)
 
@@ -30,6 +37,9 @@ Do not put card numbers or PINs in these fields.
 - The summary shows today's receipts, all-time receipts, and the number of active receipts.
 - **Card (manual entry)** records an amount you have already confirmed on the separate POS machine.
   It does not charge a card or verify that a bank payment succeeded.
+- **Card (Bank POS)** starts the configured connector and shows a progress window with **Cancel transaction**.
+  A receipt is only created after a matching, approved terminal result. Confirmed cancellation on either
+  the app or terminal, and confirmed declines, create no receipt. The approved receipt always opens print preview.
 - Open **Receipt history & reprint** to see records. Double-click a row for all details.
 - Enter **From** and **To** dates, then click **Apply**. Both boundary dates are included;
   either date can be blank. **All dates** clears the filter. The top summary always covers
@@ -93,6 +103,57 @@ A physical PP9000EU test is still required on your Windows computer.
 Amounts are stored as whole halalas (100 halalas = 1 SAR), avoiding floating-point rounding errors.
 The date uses the computer's local calendar date. Audit timestamps are stored in UTC.
 
+## Bank POS setup and the remaining live-device requirement
+
+The **Propos PP9000EU is the receipt printer**, not the payment terminal. Use the supplier's ECR
+USB driver for the bank POS terminal and its separate serial settings.
+
+1. Ask the POS supplier to enable ECR integration and provide the **ECR protocol name/version,
+   official Windows SDK or interface specification, USB driver, serial settings, and test access**.
+   A COM number and ECR mode alone do not define how to purchase, cancel or verify a payment.
+2. A Receipt Recorder connector must be implemented for that SDK/protocol. The existing sample GUI
+   and an arbitrary SDK DLL/EXE are not compatible connectors. See the
+   [connector specification](docs/pos-connector-protocol.md).
+3. Connect the USB cable, install the official driver, and find the terminal under
+   **Device Manager → Ports (COM & LPT)**. If it does not expose a virtual COM port, this USB/serial
+   profile is not applicable; that supplier needs another transport adapter.
+4. Open **Bank POS setup → USB / ECR connection**. Choose the provider connector, COM port,
+   baud rate, data bits, parity, stop bits, flow control, and terminal ID if the supplier requires it.
+   The displayed defaults are editable and do not establish compatibility; use the supplier's values.
+5. Click **Check connection**. It must confirm an actual terminal handshake through the connector.
+   COM discovery merely lists ports; it sends no payment. Save settings after a successful check.
+   A changed connector or connection setting requires another check.
+
+Do not expect live payments from this build until step 2 is completed for a documented supplier protocol.
+There is no built-in test-payment or simulated-approval choice in the application.
+
+![Bank POS USB/ECR setup](docs/bank-pos-setup-preview.png)
+
+### Approval, cancellation and recovery
+
+The entered receipt details and a unique request ID are saved in a separate payment journal before a
+purchase is sent. This journal is not a receipt and is excluded from receipt totals.
+
+- **Cancel transaction** sends a cancellation request after purchase submission and keeps the window
+  open for terminal confirmation. A cancellation acknowledgement alone does not prove cancellation.
+- If approval arrives before cancellation is confirmed, the approved payment is recorded and the app
+  explains that any required bank refund must be handled with the provider. It never invents a cancellation.
+- A timeout, disconnection, mismatched response or unexpected process exit after submission leaves
+  the outcome **unconfirmed**. No receipt is created and another bank charge is blocked, including after restart.
+- Open **Bank POS setup → Pending payments**, select the request and choose **Check selected payment status**.
+  This queries the original request through the same provider; it never resends a purchase. A confirmed approval
+  records the receipt once, while confirmed decline/cancellation releases the pending request without a receipt.
+- If the provider cannot confirm the outcome, it remains pending. The supplier must supply a status/reconciliation
+  mechanism; deleting the journal or assuming a timeout means failure is not a recovery method.
+- If the terminal approved but the database write fails, keep the request ID and reconcile the original payment;
+  do not create another charge. A receipt replay for the same approved request is idempotent.
+
+The application retains the supplied card brand and **only four card-ending digits** from connector responses.
+It does not retain full card numbers, PINs, CVVs, track data or raw SDK responses. A missing brand/last four is
+shown as **Not supplied by terminal**, rather than guessed. CSV masks card endings as `**** 0012` so Excel
+does not remove leading zeros. Bank transaction ID, approval code, terminal ID and provider are also available
+in receipt details, printouts and the CSV report. Existing manual receipts and saved print designs are preserved.
+
 ## Where the data is saved
 
 On Windows:
@@ -113,8 +174,9 @@ Reopen the application and verify the receipts. CSV exports are reports, not dat
 
 Use **Back up data** in the old app, then close it. Download the new Windows build, extract it,
 and run its `ReceiptRecorder.exe` as the same Windows user. It finds your existing data automatically.
-On first launch it adds the phone/address fields without changing receipt numbers or amounts.
-Before the upgrade it also creates `receipts-before-printing-update.sqlite3` beside the live database.
+On first launch it adds missing fields without changing receipt numbers or amounts. The printing migration
+creates `receipts-before-printing-update.sqlite3`; the bank-POS migration creates
+`receipts-before-bank-pos-update.sqlite3` beside the live database when the corresponding fields are first added.
 
 To use a separate data folder:
 
@@ -133,14 +195,17 @@ Alternatively, after this project has been pushed to GitHub, open **Actions → 
 Download the **ReceiptRecorder-Windows** artifact from a successful run and extract the EXE.
 Build results and downloadable files appear in the Actions run.
 
-## Future bank/POS connections
+## Supplied reference application
 
 The supplied `ViknPOSIntegration.exe` is a compiled .NET 8 Windows application. Static inspection
 found COM-port, baud-rate, purchase-amount and payment-result components, along with Mada SDK components.
-It was inspected as a reference, not executed or copied into this application.
+It was inspected as a reference, not executed or copied into this application. Static SDK metadata includes
+COM connection, connection testing, purchase and cancellation entry points, but does not establish the
+supported terminal protocols, response mappings, status reconciliation or current SDK distribution rights.
+The reference application's bundled SDK binaries are not published in this repository or packaged into the app.
 
-The receipt-recording logic is separate from the screen so a supported POS connector can later save
-confirmed payments. Different banks or machines may need different SDKs, protocols, drivers and ECR settings.
+The receipt-recording logic is separate from the screen and accepts confirmed results through the documented
+connector boundary. Different suppliers may need different SDKs, protocols, drivers and ECR settings.
 A universal connector cannot be assumed from the brand or the COM port alone.
 
 For each intended integration, obtain the provider's ECR/POS integration documentation and SDK,
@@ -164,7 +229,11 @@ creates a receipt through the UI, checks totals/history, restarts the UI against
 then verifies export, backup, and void behavior. It does not charge a card or contact a bank.
 
 The suite also exercises database upgrades, customer details, print failures after saving,
-date-range filtering, selected reprints and the designer. For a real browser check:
+date-range filtering, selected reprints and the designer. Bank workflow tests cover approval, both cancellation
+sources, cancellation races, disconnections, malformed/mismatched results, duplicate prevention, restart recovery,
+and data minimization. Test-only helper processes are under `tests/` and are not packaged into the Windows EXE.
+Passing these tests does not validate any supplier SDK or certify a live terminal connection.
+For a real browser check:
 
 ```bash
 python3 -m pip install -r requirements-test.txt

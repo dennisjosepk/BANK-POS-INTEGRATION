@@ -16,8 +16,10 @@ from tkinter import font as tkfont
 from ledger import METHODS, Ledger, format_amount
 from receipt_designer import ReceiptDesigner
 from receipt_printing import ReceiptDesign, open_receipts, receipt_values, FIELD_LABELS
+from pos import BANK_METHOD, BankConnector, PosConfig, PosError, PosResult, new_request_id
+from pos_ui import PaymentProgress, PosSetup
 
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 
 
 def default_data_path() -> Path:
@@ -38,6 +40,8 @@ class ReceiptApp:
         self.checked_ids = set()
         self.active_filters = ("", "")
         self.designer_window = None
+        self.pos_setup = None
+        self.active_pos = None
         root.title(f"Receipt Recorder {APP_VERSION}")
         root.geometry("1140x800")
         root.minsize(1000, 720)
@@ -75,7 +79,8 @@ class ReceiptApp:
         header.grid(row=0, sticky="ew")
         header.columnconfigure(0, weight=1)
         ttk.Label(header, text="Receipt Recorder", style="Title.TLabel").grid(sticky="w")
-        ttk.Button(header, text="Receipt designer · 80 mm", command=self.open_designer).grid(row=0, column=1)
+        ttk.Button(header, text="Bank POS setup", command=self.open_pos_setup).grid(row=0, column=1, padx=(0, 8))
+        ttk.Button(header, text="Receipt designer · 80 mm", command=self.open_designer).grid(row=0, column=2)
         ttk.Label(body, text="Record money received in Saudi riyals. Print and find your receipts.").grid(
             row=1, sticky="w", pady=(2, 14))
         summary = ttk.Frame(body)
@@ -102,6 +107,8 @@ class ReceiptApp:
         ttk.Label(body, text=f"Data: {ledger.path}", foreground="#65738a", wraplength=1050).grid(
             row=5, sticky="w", pady=(4, 0))
         self.refresh()
+        if self.ledger.pending_pos():
+            self.status.set("An earlier bank payment is unconfirmed. Open Bank POS setup → Pending payments before taking another card payment.")
         self.amount_entry.focus_set()
 
     def build_form(self):
@@ -141,7 +148,10 @@ class ReceiptApp:
         actions.columnconfigure(0, weight=1)
         ttk.Button(actions, text="Save & print", command=lambda: self.save(force_print=True)).grid(row=0, column=1, padx=(0, 8))
         ttk.Button(actions, text="Save receipt", style="Save.TButton", command=self.save).grid(row=0, column=2)
-        ttk.Label(self.new_tab, text="Manual recording. The bank POS machine is not connected.").grid(row=2, sticky="w")
+        self.pos_hint = tk.StringVar()
+        ttk.Label(self.new_tab, textvariable=self.pos_hint, wraplength=1000).grid(row=2, sticky="w")
+        self.fields["method"].trace_add("write", lambda *_: self.update_pos_hint())
+        self.update_pos_hint()
 
     def build_history(self):
         page = self.history_tab
@@ -173,12 +183,12 @@ class ReceiptApp:
         table.grid(row=3, sticky="nsew")
         table.rowconfigure(0, weight=1)
         table.columnconfigure(0, weight=1)
-        columns = ("print", "id", "date", "amount", "payer", "method", "reference", "status")
+        columns = ("print", "id", "date", "amount", "payer", "method", "reference", "card_brand", "card_last4", "status")
         self.tree = ttk.Treeview(table, columns=columns, show="headings", selectmode="browse", height=8)
         for key, heading, width in zip(columns,
                                       ("Print", "Receipt", "Received date", f"Amount ({self.currency})", "Received from",
-                                       "Method", "Invoice / reference", "Status"),
-                                      (50, 65, 100, 125, 155, 150, 150, 85)):
+                                       "Method", "Invoice / reference", "Card type", "Card ending", "Status"),
+                                      (50, 65, 100, 125, 155, 150, 150, 100, 100, 85)):
             self.tree.heading(key, text=heading)
             self.tree.column(key, width=width, minwidth=45, stretch=key != "print",
                              anchor="center" if key == "print" else "e" if key == "amount" else "w")
@@ -214,7 +224,8 @@ class ReceiptApp:
             self.tree.insert("", "end", iid=key,
                              values=("[x]" if key in self.checked_ids else "[ ]", row["id"], row["received_date"],
                                      format_amount(row["amount_minor"], self.currency), row["payer"], row["method"],
-                                     row["reference"], "Voided" if row["voided_at"] else "Recorded"),
+                                     row["reference"], row["card_brand"], "**** " + row["card_last4"] if row["card_last4"] else "",
+                                     "Voided" if row["voided_at"] else "Recorded"),
                              tags=("voided",) if row["voided_at"] else ())
         self.today_total.set(f"{self.currency} {format_amount(today, self.currency)}")
         self.all_total.set(f"{self.currency} {format_amount(total, self.currency)}")
@@ -243,25 +254,125 @@ class ReceiptApp:
             messagebox.showerror("Preference not saved", str(error), parent=self.root)
 
     def save(self, force_print=False):
+        if self.active_pos:
+            self.active_pos.window.lift()
+            return
+        entry = dict(received_date=self.fields["date"].get().strip(), amount=self.fields["amount"].get(),
+                     payer=self.fields["payer"].get(), method=self.fields["method"].get(),
+                     reference=self.fields["reference"].get(), notes=self.fields["notes"].get(),
+                     payer_phone=self.fields["payer_phone"].get(), payer_address=self.fields["payer_address"].get())
+        if entry["method"] == BANK_METHOD:
+            self.begin_bank_payment(entry)
+            return
         try:
-            receipt_id = self.ledger.add(
-                self.fields["date"].get().strip(), self.fields["amount"].get(), self.fields["payer"].get(),
-                self.fields["method"].get(), self.fields["reference"].get(), self.fields["notes"].get(),
-                self.fields["payer_phone"].get(), self.fields["payer_address"].get())
+            receipt_id = self.ledger.add(**entry)
         except (ValueError, sqlite3.Error, OSError) as error:
             messagebox.showerror("Receipt not saved", str(error), parent=self.root)
             return
-        for key in ("amount", "payer", "payer_phone", "payer_address", "reference", "notes"):
-            self.fields[key].set("")
-        self.fields["date"].set(date.today().isoformat())
+        self.receipt_saved(receipt_id, print_now=force_print or self.print_after_save.get())
+
+    def receipt_saved(self, receipt_id, print_now=False, clear_form=True):
+        if clear_form:
+            for key in ("amount", "payer", "payer_phone", "payer_address", "reference", "notes"):
+                self.fields[key].set("")
+            self.fields["date"].set(date.today().isoformat())
         self.refresh()
         if str(receipt_id) in self.rows:
             self.tree.selection_set(str(receipt_id))
             self.tree.see(str(receipt_id))
         self.status.set(f"Receipt #{receipt_id} saved successfully.")
         self.amount_entry.focus_set()
-        if force_print or self.print_after_save.get():
+        if print_now:
             self.print_records([receipt_id], receipt_saved=True)
+
+    def update_pos_hint(self):
+        if self.fields["method"].get() == BANK_METHOD:
+            self.pos_hint.set("Bank POS: a compatible supplier connector and checked USB/ECR connection are required. "
+                              "A receipt is saved only after approval; print preview then opens automatically.")
+        else:
+            self.pos_hint.set("Manual recording. This payment method does not send a transaction to the bank POS.")
+
+    def open_pos_setup(self):
+        if self.pos_setup and self.pos_setup.window.winfo_exists():
+            self.pos_setup.window.lift()
+            self.pos_setup.refresh_pending()
+            return
+        self.pos_setup = PosSetup(self)
+
+    def start_pos_operation(self, config, operation, attempt, done, parent=None):
+        if self.active_pos:
+            self.active_pos.window.lift()
+            return False
+        request_id = attempt["id"] if attempt is not None else new_request_id()
+        amount = attempt["amount_minor"] if attempt is not None else 0
+        currency = attempt["currency"] if attempt is not None else self.currency
+        def completed(result, error, cancel_requested):
+            self.active_pos = None
+            done(result, error, cancel_requested)
+        self.active_pos = PaymentProgress(parent or self.root, BankConnector(config), operation,
+                                          request_id, amount, currency, completed)
+        self.active_pos.start()
+        return True
+
+    def begin_bank_payment(self, entry):
+        try:
+            self.ledger.validate_entry(**entry)
+            config = PosConfig.from_json(self.ledger.preference("pos_config"))
+            config.validate()
+            attempt = self.ledger.begin_pos_payment(entry, config.provider_id)
+        except (ValueError, OSError, sqlite3.Error) as error:
+            messagebox.showerror("Bank POS payment not started", str(error), parent=self.root)
+            return
+        self.status.set("Bank payment started. Waiting for a confirmed terminal result; no receipt saved yet.")
+        def completed(result, error, cancelled):
+            if result is None:
+                result = PosResult(attempt["id"], "cancelled", attempt["provider_id"], attempt["amount_minor"], attempt["currency"])
+            self.complete_bank_payment(result, error=error, cancelled=cancelled, new_entry=True)
+        self.start_pos_operation(config, "purchase", attempt, completed)
+
+    def complete_bank_payment(self, result, *, error="", cancelled=False, new_entry=False):
+        try:
+            receipt_id = self.ledger.finish_pos_payment(result)
+        except (ValueError, OSError, sqlite3.Error):
+            self.status.set("Bank outcome needs attention. Do not charge again; check Pending payments in Bank POS setup.")
+            messagebox.showerror("Payment needs reconciliation", "The payment result could not be recorded safely. "
+                                 "Do not charge again. Check the terminal/provider and Pending payments.\n\n"
+                                 f"Request ID: {result.request_id}", parent=self.root)
+            return
+        if receipt_id is not None:
+            self.receipt_saved(receipt_id, print_now=True, clear_form=new_entry)
+            if cancelled:
+                messagebox.showwarning("Terminal approved payment", "The terminal approved before cancellation was confirmed. "
+                                       "The approved receipt has been recorded. Any required refund must be handled with the provider.", parent=self.root)
+        elif result.status in ("cancelled", "declined"):
+            self.status.set(f"Bank payment {result.status}. No receipt was saved.")
+            messagebox.showinfo("No receipt saved", error or f"The terminal confirmed the payment was {result.status}.", parent=self.root)
+        else:
+            self.status.set("Payment outcome is unconfirmed. No receipt saved. Do not charge again; check Pending payments.")
+            messagebox.showwarning("Payment outcome unconfirmed", "No receipt has been saved. The terminal may still have processed the payment. "
+                                   "Do not charge again. Open Bank POS setup → Pending payments and check its status.\n\n"
+                                   f"Request ID: {result.request_id}", parent=self.root)
+        if self.pos_setup and self.pos_setup.window.winfo_exists():
+            self.pos_setup.refresh_pending()
+
+    def check_pending_payment(self, request_id, parent=None, after_done=None):
+        try:
+            attempt = self.ledger.pos_attempt(request_id)
+            config = PosConfig.from_json(self.ledger.preference("pos_config"))
+            config.validate()
+            if config.provider_id != attempt["provider_id"]:
+                raise PosError("Restore the connector settings for this payment's original provider before checking its status.")
+        except (ValueError, OSError, sqlite3.Error) as error:
+            messagebox.showerror("Status check not started", str(error), parent=parent or self.root)
+            return
+        def done(result, error, _cancelled):
+            if result is None:
+                messagebox.showwarning("Status still unconfirmed", error, parent=self.root)
+            else:
+                self.complete_bank_payment(result, new_entry=False)
+            if after_done:
+                after_done()
+        self.start_pos_operation(config, "status", attempt, done, parent=parent)
 
     def select(self, _event=None):
         selection = self.tree.selection()
@@ -349,7 +460,9 @@ class ReceiptApp:
             design = ReceiptDesign()
         sample = dict(id="SAMPLE", received_date=date.today().isoformat(), amount_minor=12550,
                       payer="Example Customer / Company", payer_phone="050 000 0000", payer_address="Example street, Riyadh",
-                      method=METHODS[1], reference="INV-001", notes="Example receipt for design preview only.",
+                      method=BANK_METHOD, reference="INV-001", notes="Example receipt for design preview only.",
+                      card_brand="Visa", card_last4="1234", pos_provider_id="Example-provider", pos_transaction_id="EXAMPLE-001",
+                      pos_authorization_code="123456", pos_terminal_id="EXAMPLE-TERMINAL",
                       created_at=datetime.now(timezone.utc).isoformat(timespec="seconds"), voided_at=None)
         def save_design(updated):
             self.ledger.set_preference("receipt_design", updated.to_json())
@@ -402,6 +515,11 @@ class ReceiptApp:
         self.status.set(f"Backup saved to {destination}")
 
     def close(self):
+        if self.active_pos:
+            self.active_pos.request_cancel()
+            self.active_pos.window.lift()
+            self.status.set("Waiting for the POS operation to finish. Do not disconnect the terminal during a payment.")
+            return
         self.ledger.close()
         self.root.destroy()
 

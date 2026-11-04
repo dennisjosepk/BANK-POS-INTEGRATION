@@ -18,6 +18,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from ledger import format_amount
+from pos import BANK_METHOD
 
 
 FIELD_LABELS = {
@@ -25,7 +26,10 @@ FIELD_LABELS = {
     "payer": "Received from", "payer_phone": "Phone", "payer_address": "Address",
     "method": "Payment method", "reference": "Invoice / reference", "notes": "Notes",
     "status": "Status", "created_at": "Recorded at (UTC)", "voided_at": "Voided at (UTC)",
+    "card_brand": "Card type", "card_last4": "Card ending", "pos_transaction_id": "Bank transaction",
+    "pos_authorization_code": "Approval code", "pos_terminal_id": "Terminal ID", "pos_provider_id": "POS provider",
 }
+BANK_FIELDS = {"card_brand", "card_last4", "pos_transaction_id", "pos_authorization_code", "pos_terminal_id", "pos_provider_id"}
 FONTS = ("Arial", "Segoe UI", "Consolas")
 
 
@@ -96,6 +100,17 @@ class ReceiptDesign:
             known = {item.name for item in fields(cls)}
             if set(data) - known:
                 raise ValueError
+            # Preserve saved business details, logo and labels when a new version adds fields.
+            if "field_order" in data:
+                order = data["field_order"]
+                if (not isinstance(order, list) or any(not isinstance(key, str) for key in order)
+                        or len(order) != len(set(order)) or set(order) - set(FIELD_LABELS)):
+                    raise ValueError
+                data["field_order"] = order + [key for key in FIELD_LABELS if key not in order]
+            if "labels" in data:
+                if not isinstance(data["labels"], dict) or set(data["labels"]) - set(FIELD_LABELS):
+                    raise ValueError
+                data["labels"] = {**FIELD_LABELS, **data["labels"]}
             result = cls(**data)
             result.validate()
             return result
@@ -127,6 +142,10 @@ def receipt_values(receipt, currency: str) -> dict[str, str]:
     values.update(id=f"#{row['id']}", amount=f"{currency} {format_amount(row['amount_minor'], currency)}",
                   status="VOIDED — excluded from totals" if row.get("voided_at") else "Recorded",
                   voided_at=row.get("voided_at") or "Not voided")
+    if row.get("method") == BANK_METHOD:
+        values["card_brand"] = row.get("card_brand") or "Not supplied by terminal"
+        last4 = row.get("card_last4", "")
+        values["card_last4"] = "**** " + last4 if len(last4) == 4 else "Not supplied by terminal"
     return values
 
 
@@ -141,6 +160,8 @@ def render_receipts_html(receipts, currency: str, design: ReceiptDesign, *,
         values = receipt_values(row, currency)
         blocks = []
         for key in design.field_order:
+            if key in BANK_FIELDS and dict(row).get("method") != BANK_METHOD:
+                continue
             blocks.append(f'<div class="field {"amount" if key == "amount" else ""}">'
                           f'<span class="label">{escape(design.labels[key])}: </span>'
                           f'<span class="value" dir="auto">{escape(values[key])}</span></div>')
