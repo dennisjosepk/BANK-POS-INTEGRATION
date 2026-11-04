@@ -10,12 +10,15 @@ from tkinter import filedialog, messagebox, ttk
 
 from ledger import format_amount
 from pos import BAUD_RATES, PROGRESS, PosConfig, PosError, PosResult, serial_ports
+from diagnostics import NullDiagnosticLog, attempt_tag, config_fields
+from usb_diagnostics import probe_message
 
 
 class PaymentProgress:
-    def __init__(self, parent, connector, operation, request_id, amount_minor, currency, on_done):
+    def __init__(self, parent, connector, operation, request_id, amount_minor, currency, on_done, logger=None):
         self.connector, self.operation, self.request_id = connector, operation, request_id
         self.amount_minor, self.currency, self.on_done = amount_minor, currency, on_done
+        self.log = logger or NullDiagnosticLog()
         self.cancel_event = threading.Event()
         self.events = queue.Queue()
         self.window = tk.Toplevel(parent)
@@ -46,13 +49,15 @@ class PaymentProgress:
                 result = self.connector.run(self.operation, self.request_id, self.amount_minor, self.currency,
                                             self.cancel_event, lambda stage: self.events.put(("progress", stage)))
                 self.events.put(("result", result))
-            except PosError:
+            except PosError as error:
+                self.log.exception("pos_operation_error", error, operation=self.operation, attempt_tag=attempt_tag(self.request_id))
                 # BankConnector only raises before a financial request was sent.
                 message = ("No payment was sent. Check the compatible bank connector and ECR/USB settings."
                            if self.operation == "purchase" else
                            "Connection/status was not confirmed. Any earlier unconfirmed payment remains unresolved.")
                 self.events.put(("error", message))
-            except Exception:
+            except Exception as error:
+                self.log.exception("pos_operation_error", error, operation=self.operation, attempt_tag=attempt_tag(self.request_id))
                 # Never interpret a worker failure as proof of a cancelled bank transaction.
                 self.events.put(("result", PosResult(self.request_id, "unknown", self.connector.config.provider_id,
                                                      self.amount_minor, self.currency)))
@@ -63,6 +68,7 @@ class PaymentProgress:
         if self.cancel_event.is_set():
             return
         self.cancel_event.set()
+        self.log.record("pos_ui_cancel", operation=self.operation, attempt_tag=attempt_tag(self.request_id), reason="user")
         self.cancel_button.state(["disabled"])
         self.message.set(PROGRESS["cancelling"] if self.operation == "purchase"
                          else "Stopping this check. An unconfirmed payment will remain unconfirmed.")
@@ -143,13 +149,19 @@ class PosSetup:
         controls.grid(row=6, column=0, columnspan=4, sticky="ew", pady=(10, 12))
         ttk.Button(controls, text="Refresh COM ports", command=self.refresh_ports).pack(side="left")
         ttk.Button(controls, text="Choose connector...", command=self.choose_connector).pack(side="left", padx=8)
-        ttk.Button(controls, text="Check connection", command=self.check).pack(side="left")
+        ttk.Button(controls, text="Check bank connection", command=self.check).pack(side="left")
         ttk.Button(controls, text="Save settings", style="Save.TButton", command=self.save).pack(side="right")
+        diagnostics = ttk.Frame(form)
+        diagnostics.grid(row=7, column=0, columnspan=4, sticky="ew", pady=(0, 8))
+        ttk.Button(diagnostics, text="Check USB / COM", command=self.check_usb).pack(side="left")
+        ttk.Button(diagnostics, text="Export diagnostic log", command=lambda: self.app.export_diagnostics(parent=self.window)).pack(
+            side="left", padx=8)
+        ttk.Button(diagnostics, text="View diagnostics", command=self.app.open_diagnostics).pack(side="left")
         self.connection_status = tk.StringVar(value="Connection not checked. Use Check connection to verify the terminal handshake.")
-        ttk.Label(form, textvariable=self.connection_status, wraplength=830).grid(row=7, column=0, columnspan=4, sticky="w", pady=10)
+        ttk.Label(form, textvariable=self.connection_status, wraplength=830).grid(row=8, column=0, columnspan=4, sticky="w", pady=10)
         ttk.Label(form, text="No live supplier connector is included in this build. A connector must be implemented "
                   "for the supplier's documented ECR SDK/protocol before live payments can be enabled.", wraplength=830).grid(
-            row=8, column=0, columnspan=4, sticky="w", pady=10)
+            row=9, column=0, columnspan=4, sticky="w", pady=10)
         pending = ttk.LabelFrame(self.notebook, text="Pending / unconfirmed payments", padding=12)
         self.notebook.add(pending, text="  Pending payments  ")
         pending.columnconfigure(0, weight=1)
@@ -175,11 +187,12 @@ class PosSetup:
 
     def config(self):
         values = {key: variable.get().strip() for key, variable in self.variables.items()}
+        values["port"] = values["port"].upper()
         try:
             values["baud_rate"], values["timeout_seconds"] = int(values["baud_rate"]), int(values["timeout_seconds"])
             values["data_bits"] = int(values["data_bits"])
         except ValueError:
-            raise PosError("Enter a valid baud rate and timeout in seconds.") from None
+            raise PosError("Enter a valid baud rate and timeout in seconds.", "invalid_serial_parameters") from None
         result = PosConfig(**values)
         if self.checked_config:
             checked = self.checked_config
@@ -191,6 +204,7 @@ class PosSetup:
 
     def refresh_ports(self):
         ports = serial_ports()
+        self.app.diagnostics.record("ports_detected", ports=ports, port_count=len(ports))
         self.port_list.configure(values=ports)
         self.connection_status.set("Detected: " + ", ".join(ports) if ports
                                    else "No COM ports detected. Check the terminal's ECR USB driver and USB cable.")
@@ -203,12 +217,15 @@ class PosSetup:
             self.connection_status.set("Connector changed. Check the connection before taking payments.")
 
     def check(self):
+        snapshot = config_fields({key: variable.get() for key, variable in self.variables.items()})
+        self.app.diagnostics.record("pos_check_requested", **snapshot)
         try:
             config = self.config()
             config.validate(require_verified=False)
             config.provider_id = ""
             config.verified_fingerprint = ""
         except (PosError, OSError) as error:
+            self.app.diagnostics.exception("pos_config_error", error, **snapshot)
             messagebox.showerror("Connection setup needed", str(error), parent=self.window)
             return
         def done(result, error, _cancelled):
@@ -220,22 +237,30 @@ class PosSetup:
                     self.connection_status.set("The connector file changed during the check. Select it and check again.")
                     return
                 self.checked_config = config
+                self.app.diagnostics.record("pos_check_result", status="connected", **config_fields(config))
                 self.connection_status.set(f"Terminal handshake confirmed by {result.provider_id} on {config.port}. Save settings to use it.")
             else:
+                self.app.diagnostics.record("pos_check_result", status="not_confirmed")
                 self.connection_status.set("Connection was not confirmed. No payment was sent.")
                 if error:
                     messagebox.showwarning("Connection not confirmed", error, parent=self.window)
         self.app.start_pos_operation(config, "check_connection", None, done, parent=self.window)
+
+    def check_usb(self):
+        self.app.check_usb_port(self.variables["port"].get(), parent=self.window,
+                               after_done=lambda result: self.connection_status.set(probe_message(result)))
 
     def save(self):
         try:
             config = self.config()
             config.validate()
             self.app.ledger.set_preference("pos_config", config.to_json())
+            self.app.diagnostics.record("pos_config_saved", **config_fields(config))
             self.saved = config
             self.connection_status.set(f"Settings saved for {config.port}. Each payment still requires terminal approval.")
             self.app.update_pos_hint()
         except (ValueError, OSError, sqlite3.Error) as error:
+            self.app.diagnostics.exception("pos_config_error", error, **config_fields({key: var.get() for key, var in self.variables.items()}))
             messagebox.showerror("Settings not saved", str(error), parent=self.window)
 
     def refresh_pending(self):
@@ -255,6 +280,9 @@ class PosSetup:
         self.app.check_pending_payment(selected[0], parent=self.window, after_done=self.refresh_pending)
 
     def close(self):
+        if self.app.active_usb_probe:
+            self.app.active_usb_probe.window.lift()
+            return
         if self.app.active_pos:
             self.app.active_pos.window.lift()
             return

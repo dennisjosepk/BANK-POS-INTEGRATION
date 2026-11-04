@@ -14,6 +14,9 @@ fields in receipts and reports. These paths are validated using test-only connec
 not a bank terminal. Devices sharing one ECR protocol can reuse an implemented connector;
 different protocols need different connectors even when both expose a COM port.
 
+Version **1.3.0** adds automatic rotating diagnostic logs, an exportable support `.txt` file,
+and a Windows USB/COM access check that works without any ECR SDK or provider connector.
+
 ![Application design preview with example receipts](docs/design-preview.png)
 
 The preview contains example data only. The application starts with an empty receipt book.
@@ -108,6 +111,53 @@ The date uses the computer's local calendar date. Audit timestamps are stored in
 The **Propos PP9000EU is the receipt printer**, not the payment terminal. Use the supplier's ECR
 USB driver for the bank POS terminal and its separate serial settings.
 
+### Diagnose USB / COM with only the port number
+
+If you only know the COM port and how to enable ECR/USB, you can use these diagnostics now:
+
+1. Connect the terminal by USB and enable its ECR USB mode.
+2. Click **Diagnostics** at the top of the app, then **Refresh ports** and choose the terminal's COM port.
+3. With the terminal idle, click **Check USB / COM**. No provider connector, baud-rate guess or payment amount is needed.
+4. If there is an error, click **Export diagnostic log**, save the `.txt` file, and attach that file when asking for support.
+
+The same **Check USB / COM** and **Export diagnostic log** buttons are also in **Bank POS setup**.
+The USB check detects whether Windows lists the port, attempts to open it exclusively, reads the host's
+current serial configuration, and closes it. When available it also records the selected port's USB
+vendor/product IDs (VID/PID) mapped to that port in the Windows registry, which can help identify its driver;
+USB serial numbers are excluded. Registry mappings are diagnostic clues, not proof of a terminal's ECR protocol.
+It records Windows error numbers for missing, busy,
+access-denied or driver/query failures. It never sends serial bytes, ECR probes, purchases or cancellations,
+and it does not change the serial settings. A positive result confirms Windows port access only, not a bank
+handshake or payment protocol. Host serial defaults are not proof of the terminal's settings.
+The check avoids opening the port while a POS operation is active or a payment remains unconfirmed.
+
+Bank **Check bank connection** remains separate and requires a compatible connector. If it reports a
+missing connector, that is logged as `connector_missing`; it is not evidence that the USB cable is faulty.
+
+![Connection diagnostics](docs/diagnostics-preview.png)
+
+### Diagnostic log files and privacy
+
+Logs are created automatically in:
+
+```text
+%LOCALAPPDATA%\ReceiptRecorder\logs\receipt-recorder.log
+```
+
+The current file rotates at about 1 MB, with up to three older copies. **Open log folder** opens that folder.
+Prefer **Export diagnostic log** for sharing: it combines recent events with the app/Windows versions,
+detected ports and configured COM parameters, and filters every record again before writing the `.txt` file.
+Times are in UTC. Events include configuration failures, connector start/handshake errors, cancellations,
+timeouts, final outcome categories, app exceptions and printing/database errors.
+
+The app logs fixed event/error codes, exception types and product-module line numbers rather than arbitrary
+exception messages or local file paths. Customer names, phones, addresses, notes, amounts, invoices, card
+data, bank references, provider labels, connector paths, environment values, raw SDK packets and the receipt
+database are excluded. Payment correlation uses a short hash of the request ID. Nothing is uploaded
+automatically; you decide whether to share the exported file. Logging failures do not change receipt/payment outcomes.
+
+## Configure an implemented supplier connector
+
 1. Ask the POS supplier to enable ECR integration and provide the **ECR protocol name/version,
    official Windows SDK or interface specification, USB driver, serial settings, and test access**.
    A COM number and ECR mode alone do not define how to purchase, cancel or verify a payment.
@@ -120,7 +170,7 @@ USB driver for the bank POS terminal and its separate serial settings.
 4. Open **Bank POS setup → USB / ECR connection**. Choose the provider connector, COM port,
    baud rate, data bits, parity, stop bits, flow control, and terminal ID if the supplier requires it.
    The displayed defaults are editable and do not establish compatibility; use the supplier's values.
-5. Click **Check connection**. It must confirm an actual terminal handshake through the connector.
+5. Click **Check bank connection**. It must confirm an actual terminal handshake through the connector.
    COM discovery merely lists ports; it sends no payment. Save settings after a successful check.
    A changed connector or connection setting requires another check.
 

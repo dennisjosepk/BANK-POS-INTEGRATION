@@ -8,6 +8,7 @@ import unittest
 from unittest.mock import patch
 
 from pos import BankConnector, PosConfig, PosError, new_request_id
+from diagnostics import DiagnosticLog
 
 
 class ConnectorTests(unittest.TestCase):
@@ -24,12 +25,12 @@ class ConnectorTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def run_scenario(self, scenario, operation="purchase", cancel=None, progress=None):
+    def run_scenario(self, scenario, operation="purchase", cancel=None, progress=None, logger=None):
         cancel = cancel or threading.Event()
         def launch(_args, **kwargs):
             return self.real_popen([sys.executable, str(Path(__file__).with_name("pos_fixture.py")), scenario, str(self.audit)], **kwargs)
         with patch("pos.subprocess.Popen", side_effect=launch):
-            return BankConnector(self.config).run(operation, new_request_id(), 10000, "SAR", cancel, progress or (lambda _: None))
+            return BankConnector(self.config, logger=logger).run(operation, new_request_id(), 10000, "SAR", cancel, progress or (lambda _: None))
 
     def test_handshake_and_approved_payment_metadata(self):
         result = self.run_scenario("approved")
@@ -121,6 +122,23 @@ class ConnectorTests(unittest.TestCase):
         self.config.terminal_id = "OTHER-TERMINAL"
         self.config.verified_fingerprint = self.config.fingerprint()
         self.assertEqual(self.run_scenario("approved").status, "unknown")
+
+    def test_connection_error_log_has_a_reason_but_no_payment_payload(self):
+        log = DiagnosticLog(Path(self.temp.name) / "logs", "1.3.0")
+        result = self.run_scenario("wrong_amount", logger=log)
+        self.assertEqual(result.status, "unknown")
+        text = log.path.read_text()
+        self.assertIn("amount_mismatch", text)
+        self.assertIn('"submitted":true', text)
+        for value in (result.request_id, "amount_minor", "card_last4", "card_brand", self.config.connector_path, "TEST-"):
+            self.assertNotIn(value, text)
+
+    def test_unwritable_logs_do_not_change_an_approved_result(self):
+        blocked = Path(self.temp.name) / "blocked-log-folder"
+        blocked.write_text("keep")
+        log = DiagnosticLog(blocked, "1.3.0")
+        self.assertEqual(self.run_scenario("approved", logger=log).status, "approved")
+        self.assertFalse(log.available)
 
 
 if __name__ == "__main__":

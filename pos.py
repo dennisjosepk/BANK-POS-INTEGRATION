@@ -19,6 +19,8 @@ import threading
 import time
 from uuid import uuid4
 
+from diagnostics import NullDiagnosticLog, attempt_tag, config_fields
+
 PROTOCOL = "receipt-recorder-pos/1"
 BANK_METHOD = "Card (Bank POS)"
 BAUD_RATES = (9600, 19200, 38400, 57600, 115200)
@@ -32,7 +34,9 @@ PROGRESS = {
 
 
 class PosError(ValueError):
-    pass
+    def __init__(self, message, code="pos_error"):
+        super().__init__(message)
+        self.code = code
 
 
 def serial_ports() -> list[str]:
@@ -61,7 +65,7 @@ def safe_token(value, *, limit=160, optional=False) -> str:
     if optional and value in (None, ""):
         return ""
     if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:/-]{0," + str(limit - 1) + "}", value):
-        raise PosError("The connector returned an invalid transaction identifier.")
+        raise PosError("The connector returned an invalid transaction identifier.", "invalid_identifier")
     return value
 
 
@@ -84,25 +88,25 @@ class PosConfig:
     def validate(self, *, require_verified=True):
         for value in (self.supplier, self.terminal_model):
             if not isinstance(value, str) or len(value) > 120:
-                raise PosError("Supplier and terminal model must be 120 characters or fewer.")
+                raise PosError("Supplier and terminal model must be 120 characters or fewer.", "invalid_config")
         if not re.fullmatch(r"COM[1-9][0-9]{0,3}", self.port):
-            raise PosError("Choose the terminal's Windows COM port, for example COM3.")
+            raise PosError("Choose the terminal's Windows COM port, for example COM3.", "invalid_port")
         if type(self.baud_rate) is not int or self.baud_rate not in BAUD_RATES:
-            raise PosError("Choose a baud rate supported by your supplier's ECR settings.")
+            raise PosError("Choose a baud rate supported by your supplier's ECR settings.", "invalid_baud")
         if type(self.data_bits) is not int or self.data_bits not in (5, 6, 7, 8):
-            raise PosError("Choose valid serial data bits.")
+            raise PosError("Choose valid serial data bits.", "invalid_serial_parameters")
         if self.parity not in ("None", "Even", "Odd", "Mark", "Space") or self.stop_bits not in ("1", "1.5", "2"):
-            raise PosError("Choose valid parity and stop bits.")
+            raise PosError("Choose valid parity and stop bits.", "invalid_serial_parameters")
         if self.flow_control not in ("None", "RTS/CTS", "XON/XOFF"):
-            raise PosError("Choose a supported serial flow control.")
+            raise PosError("Choose a supported serial flow control.", "invalid_serial_parameters")
         if type(self.timeout_seconds) is not int or not 15 <= self.timeout_seconds <= 300:
-            raise PosError("Payment timeout must be between 15 and 300 seconds.")
+            raise PosError("Payment timeout must be between 15 and 300 seconds.", "invalid_timeout")
         safe_token(self.terminal_id, limit=80, optional=True)
         path = Path(self.connector_path)
         if not self.connector_path or path.suffix.lower() != ".exe" or not path.is_file():
-            raise PosError("A compatible bank POS connector is required. A COM port alone cannot process payments.")
+            raise PosError("A compatible bank POS connector is required. A COM port alone cannot process payments.", "connector_missing")
         if require_verified and (not self.provider_id or self.verified_fingerprint != self.fingerprint()):
-            raise PosError("Open Bank POS setup and check the terminal connection before taking a payment.")
+            raise PosError("Open Bank POS setup and check the terminal connection before taking a payment.", "connection_not_verified")
         if self.provider_id:
             safe_token(self.provider_id, limit=80)
 
@@ -113,7 +117,7 @@ class PosConfig:
                 for block in iter(lambda: stream.read(1024 * 1024), b""):
                     digest.update(block)
         except OSError:
-            raise PosError("The configured connector is unavailable. Open Bank POS setup.") from None
+            raise PosError("The configured connector is unavailable. Open Bank POS setup.", "connector_unavailable") from None
         settings = dict(path=str(Path(self.connector_path).resolve()), connection=self.connection(), file_hash=digest.hexdigest())
         return hashlib.sha256(json.dumps(settings, sort_keys=True).encode()).hexdigest()
 
@@ -134,7 +138,7 @@ class PosConfig:
                 raise ValueError
             return cls(**values)
         except (ValueError, TypeError):
-            raise PosError("The POS settings are invalid. Open Bank POS setup to configure them again.") from None
+            raise PosError("The POS settings are invalid. Open Bank POS setup to configure them again.", "invalid_config") from None
 
 
 @dataclass(frozen=True)
@@ -157,12 +161,12 @@ class PosResult:
 def parse_payment_result(packet, request_id, amount_minor, currency, provider_id):
     """Validate correlation and retain only the permitted, non-sensitive fields."""
     if packet.get("request_id") != request_id or packet.get("status") not in FINAL_STATUSES:
-        raise PosError("The terminal response could not be matched to this payment. Check its status before retrying.")
+        raise PosError("The terminal response could not be matched to this payment. Check its status before retrying.", "response_mismatch")
     status = packet["status"]
     if status != "approved":
         return PosResult(request_id, status, provider_id, amount_minor, currency)
     if type(packet.get("amount_minor")) is not int or packet["amount_minor"] != amount_minor or packet.get("currency") != currency:
-        raise PosError("The approved amount or currency did not match this payment. Check the terminal before retrying.")
+        raise PosError("The approved amount or currency did not match this payment. Check the terminal before retrying.", "amount_mismatch")
     transaction_id = safe_token(packet.get("transaction_id"))
     brand = packet.get("card_brand", "")
     if not isinstance(brand, str) or not re.fullmatch(r"[A-Za-z][A-Za-z .-]{0,39}", brand):
@@ -185,13 +189,20 @@ def parse_payment_result(packet, request_id, amount_minor, currency, provider_id
 class BankConnector:
     """One helper process per operation; cancellation must be terminal-confirmed."""
 
-    def __init__(self, config: PosConfig):
+    def __init__(self, config: PosConfig, logger=None):
         self.config = config
+        self.log = logger or NullDiagnosticLog()
 
     def run(self, operation, request_id, amount_minor, currency, cancel, progress):
-        self.config.validate(require_verified=operation != "check_connection")
+        context = dict(operation=operation, attempt_tag=attempt_tag(request_id))
+        self.log.record("pos_operation_start", **context, **config_fields(self.config))
+        try:
+            self.config.validate(require_verified=operation != "check_connection")
+        except (ValueError, OSError) as error:
+            self.log.exception("pos_validation_error", error, **context)
+            raise
         if operation not in ("check_connection", "purchase", "status"):
-            raise PosError("Unsupported POS operation.")
+            raise PosError("Unsupported POS operation.", "unsupported_operation")
         process = None
         sent = False
         cancellation_sent = False
@@ -199,15 +210,19 @@ class BankConnector:
         reader_stop = threading.Event()
         provider_id = self.config.provider_id
         pre_send_status = "unknown" if operation == "status" else "cancelled"
+        def finished(result):
+            self.log.record("pos_operation_result", **context, status=result.status, submitted=sent)
+            return result
         try:
             progress("connecting")
             if cancel.is_set():
-                return PosResult(request_id, pre_send_status, provider_id, amount_minor, currency)
+                return finished(PosResult(request_id, pre_send_status, provider_id, amount_minor, currency))
             process = subprocess.Popen(
                 [self.config.connector_path, "--receipt-recorder-stdio"], stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
+            self.log.record("pos_helper_start", **context)
             def read_messages():
                 def deliver(value):
                     while not reader_stop.is_set():
@@ -219,7 +234,10 @@ class BankConnector:
                 try:
                     while not reader_stop.is_set():
                         line = process.stdout.readline(16_385)
+                        if reader_stop.is_set():
+                            return
                         if not line or len(line) > 16_384:
+                            self.log.record("pos_invalid_frame" if line else "pos_helper_exit", **context)
                             deliver(None)
                             return
                         try:
@@ -227,6 +245,7 @@ class BankConnector:
                             if not isinstance(value, dict):
                                 raise ValueError
                         except (ValueError, UnicodeError):
+                            self.log.record("pos_invalid_frame", **context, error_code="invalid_frame")
                             deliver(None)
                             return
                         deliver(value)
@@ -247,68 +266,80 @@ class BankConnector:
             deadline = time.monotonic() + 15
             while True:
                 if cancel.is_set():
-                    return PosResult(request_id, pre_send_status, provider_id, amount_minor, currency)
+                    return finished(PosResult(request_id, pre_send_status, provider_id, amount_minor, currency))
                 try:
                     hello = messages.get(timeout=0.1)
                     break
                 except queue.Empty:
                     if time.monotonic() > deadline:
-                        raise PosError("The selected program did not answer as a compatible POS connector.")
+                        self.log.record("pos_handshake_timeout", **context, error_code="handshake_timeout")
+                        raise PosError("The selected program did not answer as a compatible POS connector.", "handshake_timeout")
             required = {"purchase", "cancel", "status", "check_connection"}
             if (not hello or hello.get("type") != "hello" or hello.get("protocol") != PROTOCOL
                     or not isinstance(hello.get("capabilities"), list) or not required.issubset(hello["capabilities"])):
-                raise PosError("The selected program is not a supported POS connector with cancellation and status checking.")
+                raise PosError("The selected program is not a supported POS connector with cancellation and status checking.", "unsupported_connector")
             provider_id = safe_token(hello.get("provider_id"), limit=80)
             if self.config.provider_id and provider_id != self.config.provider_id:
-                raise PosError("The connector provider changed. Check its connection in POS setup again.")
+                raise PosError("The connector provider changed. Check its connection in POS setup again.", "provider_changed")
+            self.log.record("pos_handshake_ok", **context)
             if cancel.is_set():
-                return PosResult(request_id, pre_send_status, provider_id, amount_minor, currency)
+                return finished(PosResult(request_id, pre_send_status, provider_id, amount_minor, currency))
             request = dict(op=operation, request_id=request_id, connection=self.config.connection())
             if operation != "check_connection":
                 request.update(amount_minor=amount_minor, currency=currency)
             # From this point on any failure is an unknown outcome, not a failed/cancelled payment.
             sent = True
             send(request)
+            self.log.record("pos_operation_sent", **context, submitted=True)
             deadline = time.monotonic() + self.config.timeout_seconds
             cancel_deadline = None
+            last_stage = None
             while True:
                 if cancel.is_set() and operation != "purchase":
-                    return PosResult(request_id, pre_send_status, provider_id, amount_minor, currency)
+                    return finished(PosResult(request_id, pre_send_status, provider_id, amount_minor, currency))
                 if operation == "purchase" and not cancellation_sent and (cancel.is_set() or time.monotonic() > deadline):
                     progress("cancelling")
                     send(dict(op="cancel", request_id=request_id))
+                    self.log.record("pos_cancel_requested", **context, reason="user" if cancel.is_set() else "timeout")
                     cancellation_sent = True
                     cancel_deadline = time.monotonic() + 15
                 if (cancel_deadline and time.monotonic() > cancel_deadline) or (
                         operation != "purchase" and time.monotonic() > deadline):
-                    return PosResult(request_id, "unknown", provider_id, amount_minor, currency)
+                    self.log.record("pos_timeout", **context, error_code="cancel_unconfirmed" if cancel_deadline else "operation_timeout")
+                    return finished(PosResult(request_id, "unknown", provider_id, amount_minor, currency))
                 try:
                     packet = messages.get(timeout=0.1)
                 except queue.Empty:
                     continue
                 if packet is None:
-                    return PosResult(request_id, "unknown", provider_id, amount_minor, currency)
+                    self.log.record("pos_helper_exit", **context, submitted=sent, error_code="helper_exit")
+                    return finished(PosResult(request_id, "unknown", provider_id, amount_minor, currency))
                 if packet.get("request_id") != request_id:
-                    raise PosError("The terminal returned a response for a different payment.")
+                    raise PosError("The terminal returned a response for a different payment.", "response_mismatch")
                 if packet.get("type") == "progress":
                     stage = packet.get("stage")
                     if stage in PROGRESS and not cancellation_sent:
                         progress(stage)
+                        if stage != last_stage:
+                            self.log.record("pos_progress", **context, stage=stage)
+                            last_stage = stage
                     continue
                 if packet.get("type") != "result":
-                    raise PosError("The connector returned an unsupported response.")
+                    raise PosError("The connector returned an unsupported response.", "invalid_frame")
                 if operation == "check_connection":
                     if packet.get("status") != "connected":
-                        raise PosError("The connector could not confirm a terminal connection. Check ECR mode, driver and COM settings.")
-                    return PosResult(request_id, "connected", provider_id)
+                        raise PosError("The connector could not confirm a terminal connection. Check ECR mode, driver and COM settings.", "connection_unconfirmed")
+                    return finished(PosResult(request_id, "connected", provider_id))
                 if (packet.get("status") == "approved" and self.config.terminal_id
                         and packet.get("terminal_id") != self.config.terminal_id):
-                    raise PosError("The approval came from a different terminal.")
-                return parse_payment_result(packet, request_id, amount_minor, currency, provider_id)
-        except (OSError, ValueError, TypeError, KeyError):
+                    raise PosError("The approval came from a different terminal.", "terminal_mismatch")
+                return finished(parse_payment_result(packet, request_id, amount_minor, currency, provider_id))
+        except (OSError, ValueError, TypeError, KeyError) as error:
+            self.log.exception("pos_operation_error", error, **context, submitted=sent)
             if sent and operation != "check_connection":
-                return PosResult(request_id, "unknown", provider_id, amount_minor, currency)
-            raise PosError("Could not confirm a connection. Verify the bank connector, ECR mode and USB/COM settings.") from None
+                return finished(PosResult(request_id, "unknown", provider_id, amount_minor, currency))
+            raise PosError("Could not confirm a connection. Verify the bank connector, ECR mode and USB/COM settings.",
+                           getattr(error, "code", "connection_unconfirmed")) from None
         finally:
             reader_stop.set()
             if process is not None:

@@ -18,8 +18,12 @@ from receipt_designer import ReceiptDesigner
 from receipt_printing import ReceiptDesign, open_receipts, receipt_values, FIELD_LABELS
 from pos import BANK_METHOD, BankConnector, PosConfig, PosError, PosResult, new_request_id
 from pos_ui import PaymentProgress, PosSetup
+from diagnostics import DiagnosticLog, attempt_tag, config_fields
+from diagnostics_ui import DiagnosticsWindow, UsbProbeWindow
+from usb_diagnostics import probe_message
+from pos import serial_ports
 
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 
 
 def default_data_path() -> Path:
@@ -31,8 +35,11 @@ def default_data_path() -> Path:
 
 
 class ReceiptApp:
-    def __init__(self, root: tk.Tk, ledger: Ledger):
+    def __init__(self, root: tk.Tk, ledger: Ledger, diagnostics=None):
         self.root, self.ledger = root, ledger
+        self.diagnostics = diagnostics or DiagnosticLog(ledger.path.parent / "logs", APP_VERSION)
+        if diagnostics is None:
+            self.diagnostics.record("app_start")
         self.currency = ledger.currency
         if self.currency is None:
             raise ValueError("Choose a ledger currency before opening the receipt screen.")
@@ -42,11 +49,14 @@ class ReceiptApp:
         self.designer_window = None
         self.pos_setup = None
         self.active_pos = None
+        self.active_usb_probe = None
+        self.diagnostics_window = None
         root.title(f"Receipt Recorder {APP_VERSION}")
         root.geometry("1140x800")
         root.minsize(1000, 720)
         root.configure(background="#f2f5fa")
         root.protocol("WM_DELETE_WINDOW", self.close)
+        root.report_callback_exception = self.report_ui_error
         family = "Segoe UI" if sys.platform == "win32" else "Helvetica"
         for name in ("TkDefaultFont", "TkTextFont", "TkMenuFont", "TkHeadingFont"):
             tkfont.nametofont(name, root).configure(family=family, size=10)
@@ -81,6 +91,7 @@ class ReceiptApp:
         ttk.Label(header, text="Receipt Recorder", style="Title.TLabel").grid(sticky="w")
         ttk.Button(header, text="Bank POS setup", command=self.open_pos_setup).grid(row=0, column=1, padx=(0, 8))
         ttk.Button(header, text="Receipt designer · 80 mm", command=self.open_designer).grid(row=0, column=2)
+        ttk.Button(header, text="Diagnostics", command=self.open_diagnostics).grid(row=0, column=3, padx=(8, 0))
         ttk.Label(body, text="Record money received in Saudi riyals. Print and find your receipts.").grid(
             row=1, sticky="w", pady=(2, 14))
         summary = ttk.Frame(body)
@@ -213,6 +224,7 @@ class ReceiptApp:
             rows = self.ledger.receipts(*selected_filters)
             today, total, count = self.ledger.totals()
         except (ValueError, sqlite3.Error, OSError) as error:
+            self.diagnostics.exception("ui_error", error)
             messagebox.showerror("Could not load receipts", str(error), parent=self.root)
             return False
         self.active_filters = selected_filters
@@ -254,6 +266,9 @@ class ReceiptApp:
             messagebox.showerror("Preference not saved", str(error), parent=self.root)
 
     def save(self, force_print=False):
+        if self.active_usb_probe:
+            self.active_usb_probe.window.lift()
+            return
         if self.active_pos:
             self.active_pos.window.lift()
             return
@@ -267,6 +282,7 @@ class ReceiptApp:
         try:
             receipt_id = self.ledger.add(**entry)
         except (ValueError, sqlite3.Error, OSError) as error:
+            self.diagnostics.exception("receipt_save_error", error)
             messagebox.showerror("Receipt not saved", str(error), parent=self.root)
             return
         self.receipt_saved(receipt_id, print_now=force_print or self.print_after_save.get())
@@ -299,7 +315,81 @@ class ReceiptApp:
             return
         self.pos_setup = PosSetup(self)
 
+    def diagnostic_settings(self):
+        try:
+            if self.pos_setup and self.pos_setup.window.winfo_exists():
+                return config_fields({key: variable.get() for key, variable in self.pos_setup.variables.items()})
+            return config_fields(PosConfig.from_json(self.ledger.preference("pos_config")))
+        except (ValueError, OSError, sqlite3.Error, tk.TclError):
+            return {}
+
+    def open_diagnostics(self):
+        if self.diagnostics_window and self.diagnostics_window.window.winfo_exists():
+            self.diagnostics_window.window.lift()
+            self.diagnostics_window.refresh_log()
+            return
+        self.diagnostics_window = DiagnosticsWindow(self)
+
+    def export_diagnostics(self, parent=None, port=None):
+        destination = filedialog.asksaveasfilename(
+            parent=parent or self.root, title="Export diagnostic log to share", defaultextension=".txt",
+            initialfile=f"receipt-recorder-diagnostics-{datetime.now().strftime('%Y%m%d-%H%M%S')}.txt",
+            filetypes=[("Diagnostic text log", "*.txt")])
+        if not destination:
+            return
+        try:
+            snapshot = self.diagnostic_settings()
+            if port is not None:
+                snapshot["port"] = port.strip().upper()
+            ports = serial_ports()
+            snapshot.update(ports=ports, port_count=len(ports))
+            self.diagnostics.export(destination, snapshot=snapshot, protected=[self.ledger.path])
+        except (ValueError, OSError) as error:
+            self.diagnostics.exception("diagnostic_export_error", error, error_code="export_error")
+            messagebox.showerror("Could not export log", "Choose a writable .txt file outside the application log folder. "
+                                 "Your receipt database is not included.", parent=parent or self.root)
+            return
+        self.status.set(f"Diagnostic log exported to {destination}. You can attach this .txt file when asking for support.")
+        messagebox.showinfo("Diagnostic log exported", "The diagnostic .txt file is saved. You can attach it in this chat.\n\n"
+                            "It contains app/Windows details, COM settings and coded errors, without the receipt database, "
+                            "customer details, card data or raw SDK messages.", parent=parent or self.root)
+
+    def check_usb_port(self, port, parent=None, after_done=None):
+        if self.active_pos or self.active_usb_probe:
+            self.diagnostics.record("usb_probe_result", result_code="skipped_active", error_code="operation_active")
+            messagebox.showinfo("Another check is running", "Wait for the current POS or USB check to finish.", parent=parent or self.root)
+            return False
+        try:
+            allow_open = not bool(self.ledger.pending_pos())
+        except sqlite3.Error as error:
+            self.diagnostics.exception("usb_probe_error", error, error_code="database_error")
+            allow_open = False
+        self.diagnostics.record("usb_probe_start", port=port.strip().upper(), **{
+            key: value for key, value in self.diagnostic_settings().items() if key != "port"})
+        def done(result):
+            self.active_usb_probe = None
+            self.diagnostics.record("usb_probe_result", **result)
+            self.status.set("USB / COM diagnostic check finished. Use Export diagnostic log to share its result.")
+            if after_done:
+                after_done(result)
+            messagebox.showinfo("USB / COM diagnostic result", probe_message(result), parent=parent or self.root)
+        self.active_usb_probe = UsbProbeWindow(parent or self.root, port, allow_open, done, self.diagnostics)
+        return True
+
+    def report_ui_error(self, kind, error, traceback):
+        self.diagnostics.exception("ui_error", error)
+        message = "An unexpected application error occurred. Open Diagnostics → Export diagnostic log to share the coded error."
+        try:
+            if self.active_pos or self.ledger.pending_pos():
+                message += "\n\nA bank payment may still be unconfirmed. Check Pending payments before taking another card payment."
+        except sqlite3.Error:
+            pass
+        messagebox.showerror("Application error", message, parent=self.root)
+
     def start_pos_operation(self, config, operation, attempt, done, parent=None):
+        if self.active_usb_probe:
+            self.active_usb_probe.window.lift()
+            return False
         if self.active_pos:
             self.active_pos.window.lift()
             return False
@@ -309,8 +399,8 @@ class ReceiptApp:
         def completed(result, error, cancel_requested):
             self.active_pos = None
             done(result, error, cancel_requested)
-        self.active_pos = PaymentProgress(parent or self.root, BankConnector(config), operation,
-                                          request_id, amount, currency, completed)
+        self.active_pos = PaymentProgress(parent or self.root, BankConnector(config, logger=self.diagnostics), operation,
+                                          request_id, amount, currency, completed, logger=self.diagnostics)
         self.active_pos.start()
         return True
 
@@ -321,6 +411,7 @@ class ReceiptApp:
             config.validate()
             attempt = self.ledger.begin_pos_payment(entry, config.provider_id)
         except (ValueError, OSError, sqlite3.Error) as error:
+            self.diagnostics.exception("pos_start_error", error, **self.diagnostic_settings())
             messagebox.showerror("Bank POS payment not started", str(error), parent=self.root)
             return
         self.status.set("Bank payment started. Waiting for a confirmed terminal result; no receipt saved yet.")
@@ -333,21 +424,25 @@ class ReceiptApp:
     def complete_bank_payment(self, result, *, error="", cancelled=False, new_entry=False):
         try:
             receipt_id = self.ledger.finish_pos_payment(result)
-        except (ValueError, OSError, sqlite3.Error):
+        except (ValueError, OSError, sqlite3.Error) as error:
+            self.diagnostics.exception("pos_record_error", error, attempt_tag=attempt_tag(result.request_id))
             self.status.set("Bank outcome needs attention. Do not charge again; check Pending payments in Bank POS setup.")
             messagebox.showerror("Payment needs reconciliation", "The payment result could not be recorded safely. "
                                  "Do not charge again. Check the terminal/provider and Pending payments.\n\n"
                                  f"Request ID: {result.request_id}", parent=self.root)
             return
         if receipt_id is not None:
+            self.diagnostics.record("pos_recorded", attempt_tag=attempt_tag(result.request_id), status="approved")
             self.receipt_saved(receipt_id, print_now=True, clear_form=new_entry)
             if cancelled:
                 messagebox.showwarning("Terminal approved payment", "The terminal approved before cancellation was confirmed. "
                                        "The approved receipt has been recorded. Any required refund must be handled with the provider.", parent=self.root)
         elif result.status in ("cancelled", "declined"):
+            self.diagnostics.record("pos_result", attempt_tag=attempt_tag(result.request_id), status=result.status)
             self.status.set(f"Bank payment {result.status}. No receipt was saved.")
             messagebox.showinfo("No receipt saved", error or f"The terminal confirmed the payment was {result.status}.", parent=self.root)
         else:
+            self.diagnostics.record("pos_result", attempt_tag=attempt_tag(result.request_id), status="unknown")
             self.status.set("Payment outcome is unconfirmed. No receipt saved. Do not charge again; check Pending payments.")
             messagebox.showwarning("Payment outcome unconfirmed", "No receipt has been saved. The terminal may still have processed the payment. "
                                    "Do not charge again. Open Bank POS setup → Pending payments and check its status.\n\n"
@@ -363,6 +458,7 @@ class ReceiptApp:
             if config.provider_id != attempt["provider_id"]:
                 raise PosError("Restore the connector settings for this payment's original provider before checking its status.")
         except (ValueError, OSError, sqlite3.Error) as error:
+            self.diagnostics.exception("pos_status_error", error)
             messagebox.showerror("Status check not started", str(error), parent=parent or self.root)
             return
         def done(result, error, _cancelled):
@@ -442,6 +538,7 @@ class ReceiptApp:
             design = ReceiptDesign.from_json(self.ledger.preference("receipt_design"))
             open_receipts(rows, self.currency, design, self.ledger.path.parent / "printouts", reprint=reprint)
         except (ValueError, OSError, sqlite3.Error) as error:
+            self.diagnostics.exception("print_error", error)
             prefix = "Your receipt is saved. Do not enter it again; you can reprint it from history.\n\n" if receipt_saved else ""
             messagebox.showwarning("Could not open print preview", prefix + str(error), parent=self.root)
             return False
@@ -482,6 +579,7 @@ class ReceiptApp:
         try:
             self.ledger.void(receipt_id)
         except (ValueError, sqlite3.Error, OSError) as error:
+            self.diagnostics.exception("receipt_void_error", error)
             messagebox.showerror("Could not void receipt", str(error), parent=self.root)
             return
         self.refresh()
@@ -496,6 +594,7 @@ class ReceiptApp:
         try:
             count = self.ledger.export_csv(Path(destination), *self.active_filters)
         except (ValueError, sqlite3.Error, OSError) as error:
+            self.diagnostics.exception("csv_error", error)
             messagebox.showerror("Export failed", str(error), parent=self.root)
             return
         self.status.set(f"Exported {count} receipts from this view (including voids) to {destination}")
@@ -510,6 +609,7 @@ class ReceiptApp:
         try:
             self.ledger.backup(Path(destination))
         except (ValueError, sqlite3.Error, OSError) as error:
+            self.diagnostics.exception("backup_error", error)
             messagebox.showerror("Backup failed", str(error), parent=self.root)
             return
         self.status.set(f"Backup saved to {destination}")
@@ -520,6 +620,11 @@ class ReceiptApp:
             self.active_pos.window.lift()
             self.status.set("Waiting for the POS operation to finish. Do not disconnect the terminal during a payment.")
             return
+        if self.active_usb_probe:
+            self.active_usb_probe.spinner.stop()
+            self.active_usb_probe.window.destroy()
+            self.active_usb_probe = None
+        self.diagnostics.record("app_close")
         self.ledger.close()
         self.root.destroy()
 
@@ -531,13 +636,16 @@ def main():
     root = tk.Tk()
     root.withdraw()
     path = args.data_dir / "receipts.sqlite3" if args.data_dir else default_data_path()
+    diagnostics = DiagnosticLog(path.parent / "logs", APP_VERSION)
+    diagnostics.record("app_start")
     ledger = None
     try:
         ledger = Ledger(path)
         if ledger.currency is None:
             ledger.set_currency("SAR")
-        ReceiptApp(root, ledger)
+        ReceiptApp(root, ledger, diagnostics=diagnostics)
     except (ValueError, sqlite3.Error, OSError) as error:
+        diagnostics.exception("startup_error", error)
         messagebox.showerror("Could not open Receipt Recorder", f"{error}\n\nData location: {path}", parent=root)
         if ledger:
             ledger.close()

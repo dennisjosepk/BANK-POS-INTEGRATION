@@ -34,7 +34,7 @@ class PosDesktopTests(unittest.TestCase):
         self.patchers.append(preview)
         owner = self
         class FakeConnector:
-            def __init__(self, config): self.config = config
+            def __init__(self, config, logger=None): self.config = config
             def run(self, operation, request_id, amount_minor, currency, cancel, progress):
                 owner.operations.append(operation)
                 progress("connecting")
