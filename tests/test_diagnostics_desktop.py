@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 from app import ReceiptApp
 from ledger import Ledger
-from pos import BANK_METHOD
+from pos import BANK_METHOD, PosConfig, PosError
 
 
 @unittest.skipUnless(sys.platform == "win32" or os.environ.get("DISPLAY"), "Requires a desktop or Xvfb")
@@ -83,6 +83,51 @@ class DiagnosticDesktopTests(unittest.TestCase):
         self.assertIn("connector_missing", text)
         self.assertIn("pos_config_error", text)
         self.assertEqual(self.ledger.pending_pos(), [])
+
+    def test_device_settings_save_without_connector_and_remain_unverified(self):
+        self.setup.variables["terminal_model"].set("A920PRO")
+        self.setup.save()
+        self.showerror.assert_not_called()
+        saved = PosConfig.from_json(self.ledger.preference("pos_config"))
+        self.assertEqual(saved.terminal_model, "A920PRO")
+        self.assertEqual(saved.port, "COM3")
+        self.assertEqual(saved.provider_id, "")
+        self.assertEqual(saved.verified_fingerprint, "")
+        self.assertIn("saved for diagnostics", self.setup.connection_status.get())
+        event = self.app.diagnostics.recent(1)[0]
+        self.assertEqual(event["event"], "pos_config_saved")
+        self.assertFalse(event["settings_checked"])
+        self.assertNotIn("error_code", event)
+        with self.assertRaises(PosError):
+            saved.validate()
+        self.setup.close()
+        with patch("pos_ui.serial_ports", return_value=["COM3"]):
+            self.app.open_pos_setup()
+        self.assertEqual(self.app.pos_setup.variables["terminal_model"].get(), "A920PRO")
+        self.assertEqual(self.app.pos_setup.variables["port"].get(), "COM3")
+        self.app.fields["method"].set(BANK_METHOD)
+        self.app.fields["amount"].set("100")
+        self.app.save()
+        self.assertIsNone(self.app.active_pos)
+        self.assertEqual(self.ledger.pending_pos(), [])
+        self.assertEqual(len(self.ledger.receipts()), 1)
+
+    def test_model_only_preferences_can_be_saved_before_a_port_is_selected(self):
+        self.setup.variables["terminal_model"].set("A920PRO")
+        self.setup.variables["port"].set("")
+        self.setup.save()
+        self.showerror.assert_not_called()
+        saved = PosConfig.from_json(self.ledger.preference("pos_config"))
+        saved.validate_settings(require_port=False)
+        self.assertEqual(saved.terminal_model, "A920PRO")
+        with self.assertRaises(PosError):
+            saved.validate()
+
+    def test_invalid_serial_preferences_still_do_not_save(self):
+        self.setup.variables["baud_rate"].set("invalid")
+        self.setup.save()
+        self.showerror.assert_called_once()
+        self.assertEqual(self.ledger.preference("pos_config"), "")
 
     def test_windows_port_busy_error_can_be_exported(self):
         with patch("diagnostics_ui.inspect_com_port", return_value=dict(port="COM3", result_code="port_busy", win_error=32)):

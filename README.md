@@ -17,6 +17,9 @@ different protocols need different connectors even when both expose a COM port.
 Version **1.3.0** adds automatic rotating diagnostic logs, an exportable support `.txt` file,
 and a Windows USB/COM access check that works without any ECR SDK or provider connector.
 
+Version **1.3.1** lets you save device/COM details for diagnostics without a provider connector.
+Saving these preferences does not verify a bank connection or enable card payments.
+
 ![Application design preview with example receipts](docs/design-preview.png)
 
 The preview contains example data only. The application starts with an empty receipt book.
@@ -121,6 +124,10 @@ If you only know the COM port and how to enable ECR/USB, you can use these diagn
 4. If there is an error, click **Export diagnostic log**, save the `.txt` file, and attach that file when asking for support.
 
 The same **Check USB / COM** and **Export diagnostic log** buttons are also in **Bank POS setup**.
+You can enter your terminal model and COM port and click **Save settings** with the connector field blank.
+These details are remembered for the next session. A successful **Check bank connection** is still required
+to enable the saved profile for bank payments. Changing connection details clears its previous verification.
+Settings needed by unconfirmed payments are preserved until those payments can be reconciled.
 The USB check detects whether Windows lists the port, attempts to open it exclusively, reads the host's
 current serial configuration, and closes it. When available it also records the selected port's USB
 vendor/product IDs (VID/PID) mapped to that port in the Windows registry, which can help identify its driver;

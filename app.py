@@ -23,7 +23,7 @@ from diagnostics_ui import DiagnosticsWindow, UsbProbeWindow
 from usb_diagnostics import probe_message
 from pos import serial_ports
 
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.3.1"
 
 
 def default_data_path() -> Path:

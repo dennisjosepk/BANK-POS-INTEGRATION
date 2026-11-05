@@ -85,11 +85,13 @@ class PosConfig:
     provider_id: str = ""
     verified_fingerprint: str = ""
 
-    def validate(self, *, require_verified=True):
+    def validate_settings(self, *, require_port=True):
+        """Validate editable preferences separately from payment readiness."""
         for value in (self.supplier, self.terminal_model):
             if not isinstance(value, str) or len(value) > 120:
                 raise PosError("Supplier and terminal model must be 120 characters or fewer.", "invalid_config")
-        if not re.fullmatch(r"COM[1-9][0-9]{0,3}", self.port):
+        if (not isinstance(self.port, str) or
+                ((require_port or self.port) and not re.fullmatch(r"COM[1-9][0-9]{0,3}", self.port))):
             raise PosError("Choose the terminal's Windows COM port, for example COM3.", "invalid_port")
         if type(self.baud_rate) is not int or self.baud_rate not in BAUD_RATES:
             raise PosError("Choose a baud rate supported by your supplier's ECR settings.", "invalid_baud")
@@ -102,6 +104,11 @@ class PosConfig:
         if type(self.timeout_seconds) is not int or not 15 <= self.timeout_seconds <= 300:
             raise PosError("Payment timeout must be between 15 and 300 seconds.", "invalid_timeout")
         safe_token(self.terminal_id, limit=80, optional=True)
+        if not isinstance(self.connector_path, str) or len(self.connector_path) > 4096 or "\x00" in self.connector_path:
+            raise PosError("Enter a valid connector path, or leave it blank for diagnostics.", "invalid_config")
+
+    def validate(self, *, require_verified=True):
+        self.validate_settings()
         path = Path(self.connector_path)
         if not self.connector_path or path.suffix.lower() != ".exe" or not path.is_file():
             raise PosError("A compatible bank POS connector is required. A COM port alone cannot process payments.", "connector_missing")

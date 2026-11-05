@@ -157,7 +157,8 @@ class PosSetup:
         ttk.Button(diagnostics, text="Export diagnostic log", command=lambda: self.app.export_diagnostics(parent=self.window)).pack(
             side="left", padx=8)
         ttk.Button(diagnostics, text="View diagnostics", command=self.app.open_diagnostics).pack(side="left")
-        self.connection_status = tk.StringVar(value="Connection not checked. Use Check connection to verify the terminal handshake.")
+        self.connection_status = tk.StringVar(value="Save device/COM settings for diagnostics. Check USB / COM works without a connector. "
+                                             "Check bank connection requires a compatible connector.")
         ttk.Label(form, textvariable=self.connection_status, wraplength=830).grid(row=8, column=0, columnspan=4, sticky="w", pady=10)
         ttk.Label(form, text="No live supplier connector is included in this build. A connector must be implemented "
                   "for the supplier's documented ECR SDK/protocol before live payments can be enabled.", wraplength=830).grid(
@@ -253,11 +254,28 @@ class PosSetup:
     def save(self):
         try:
             config = self.config()
-            config.validate()
+            config.validate_settings(require_port=False)
+            verified = False
+            try:
+                config.validate()
+                verified = True
+            except (ValueError, OSError):
+                config.provider_id = ""
+                config.verified_fingerprint = ""
+            pending = self.app.ledger.pending_pos()
+            if pending and (not verified or any(row["provider_id"] != config.provider_id for row in pending)):
+                raise PosError("Keep the original provider settings until unconfirmed payments are resolved. "
+                               "USB diagnostics and log export are still available.", "payment_pending")
             self.app.ledger.set_preference("pos_config", config.to_json())
             self.app.diagnostics.record("pos_config_saved", **config_fields(config))
             self.saved = config
-            self.connection_status.set(f"Settings saved for {config.port}. Each payment still requires terminal approval.")
+            self.checked_config = config if verified else None
+            if verified:
+                self.connection_status.set(f"Settings saved for {config.port}. These settings passed a connection check; "
+                                          "each payment still requires terminal approval.")
+            else:
+                self.connection_status.set("Device and COM settings saved for diagnostics. Use Check USB / COM. "
+                                          "Bank payments remain unavailable until a compatible connector passes Check bank connection.")
             self.app.update_pos_hint()
         except (ValueError, OSError, sqlite3.Error) as error:
             self.app.diagnostics.exception("pos_config_error", error, **config_fields({key: var.get() for key, var in self.variables.items()}))

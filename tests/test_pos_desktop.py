@@ -174,6 +174,34 @@ class PosDesktopTests(unittest.TestCase):
         self.assertEqual(self.ledger.receipts(), [])
         self.showerror.assert_called_once()
 
+    def test_changed_connection_can_save_preferences_but_requires_a_new_check(self):
+        with patch("pos_ui.serial_ports", return_value=["COM3", "COM9"]):
+            self.app.open_pos_setup()
+        setup = self.app.pos_setup
+        setup.variables["port"].set("COM9")
+        setup.save()
+        self.showerror.assert_not_called()
+        saved = PosConfig.from_json(self.ledger.preference("pos_config"))
+        self.assertEqual(saved.port, "COM9")
+        self.assertEqual(saved.provider_id, "")
+        self.assertEqual(saved.verified_fingerprint, "")
+        self.app.save()
+        self.showerror.assert_called_once()
+        self.assertEqual(self.operations, [])
+        self.assertEqual(self.ledger.receipts(), [])
+
+    def test_diagnostic_settings_cannot_overwrite_a_pending_payments_provider(self):
+        original = self.ledger.preference("pos_config")
+        self.ledger.begin_pos_payment(dict(received_date="2026-11-03", amount="100", method=BANK_METHOD), "fixture-provider")
+        with patch("pos_ui.serial_ports", return_value=["COM3", "COM9"]):
+            self.app.open_pos_setup()
+        setup = self.app.pos_setup
+        setup.variables["port"].set("COM9")
+        setup.save()
+        self.showerror.assert_called_once()
+        self.assertEqual(self.ledger.preference("pos_config"), original)
+        self.assertEqual(len(self.ledger.pending_pos()), 1)
+
 
 if __name__ == "__main__":
     unittest.main()
